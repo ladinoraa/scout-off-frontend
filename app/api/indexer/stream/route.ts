@@ -7,8 +7,17 @@
  * upstream and pipes the response body back verbatim.
  *
  * Query params forwarded transparently: topics, wallet, lastEventId.
+ *
+ * Issue #1478: the incoming `traceparent` (or a freshly minted one) is
+ * forwarded to the indexer so SSE connections are linked to the same
+ * distributed trace as the REST requests that precede them.
  */
 import { NextRequest } from 'next/server';
+import {
+  getOrCreateTraceContext,
+  outboundTraceparent,
+  TRACEPARENT_HEADER,
+} from '@/lib/traceContext';
 
 const INDEXER_BASE =
   process.env.NEXT_PUBLIC_INDEXER_API_URL ?? 'http://localhost:3001';
@@ -31,6 +40,10 @@ export async function GET(request: NextRequest): Promise<Response> {
   const upstreamHeaders: HeadersInit = {
     Accept: 'text/event-stream',
   };
+
+  // Issue #1478: forward W3C trace context to the indexer.
+  const traceCtx = getOrCreateTraceContext(request.headers);
+  upstreamHeaders[TRACEPARENT_HEADER] = outboundTraceparent(traceCtx);
 
   const lastEventId = request.headers.get('last-event-id');
   if (lastEventId) {

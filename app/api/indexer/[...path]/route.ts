@@ -1,12 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkRateLimit, getClientIp } from '@/lib/rateLimit';
+import {
+  getOrCreateTraceContext,
+  outboundTraceparent,
+  TRACEPARENT_HEADER,
+} from '@/lib/traceContext';
 
 // Same-origin proxy for packages/indexer's query API (issue #1332, extended
-// by #1298 for /players and /health). The
-// indexer sends no CORS headers and has no auth or rate limiting of its own,
-// so browser code (lib/indexerClient.ts) calls /api/indexer/* instead of the
-// indexer origin, and this route forwards only the allow-listed query routes
-// to INDEXER_API_URL_INTERNAL — keeping the indexer on a private network.
+// by #1298 for /players and /health, #1478 for W3C trace context propagation).
+// The indexer sends no CORS headers and has no auth or rate limiting of its
+// own, so browser code (lib/indexerClient.ts) calls /api/indexer/* instead of
+// the indexer origin, and this route forwards only the allow-listed query
+// routes to INDEXER_API_URL_INTERNAL — keeping the indexer on a private
+// network.
+//
+// Issue #1478: the incoming `traceparent` (or a freshly minted one) is
+// forwarded to the indexer so a cross-service trace can be assembled end-to-end.
 
 const FETCH_TIMEOUT_MS = 5000;
 const RATE_LIMIT = { limit: 120, windowMs: 60_000 };
@@ -59,6 +68,11 @@ async function proxy(
     );
   }
 
+  // Issue #1478: propagate W3C trace context to the indexer so a single user
+  // action that spans Next.js → indexer can be correlated end-to-end.
+  const traceCtx = getOrCreateTraceContext(req.headers);
+  const traceparent = outboundTraceparent(traceCtx);
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
@@ -66,7 +80,10 @@ async function proxy(
       `${indexerBaseUrl()}/${path}${req.nextUrl.search}`,
       {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          [TRACEPARENT_HEADER]: traceparent,
+        },
         body: method === 'POST' ? await req.text() : undefined,
         signal: controller.signal,
         cache: 'no-store',

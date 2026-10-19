@@ -21,7 +21,7 @@ import {
 import { createPgPoolFromEnv, getStore, initStore } from './db';
 import { LeaderElector } from './leaderElection';
 import type { EventType } from './metrics/IndexerMetrics';
-import { logger } from './logger';
+import { logger, parseTraceparent, newTraceContext, withTraceContext, makeChildTraceparent, TRACEPARENT_HEADER } from './logger';
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
 
@@ -634,50 +634,61 @@ function route(
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): void | Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://localhost');
+  // Issue #1478: propagate W3C trace context through every request so log
+  // lines carry the same traceId as the upstream Next.js request that
+  // triggered them. Echo a child span back on the response so the caller
+  // can confirm the traceparent was received.
+  const traceCtx =
+    parseTraceparent(req.headers[TRACEPARENT_HEADER] as string | undefined) ??
+    newTraceContext();
+  res.setHeader(TRACEPARENT_HEADER, makeChildTraceparent(traceCtx));
 
-  if (req.method === 'GET' && url.pathname === '/health') {
-    return handleHealth(res);
-  }
-  if (req.method === 'GET' && url.pathname === '/metrics') {
-    return handleMetrics(res);
-  }
-  if (req.method === 'GET' && url.pathname === '/events') {
-    return handleEventsQuery(url, res);
-  }
-  if (req.method === 'GET' && url.pathname === '/stream') {
-    return handleStream(req, res, url);
-  }
-  // Exact match — must precede the /players/:id/events regex below (which
-  // wouldn't match it anyway, but the ordering documents the intent).
-  if (req.method === 'GET' && url.pathname === '/players') {
-    return handlePlayersQuery(url, res);
-  }
-  if (req.method === 'POST' && url.pathname === '/validators/approval-counts') {
-    handleApprovalCountsQuery(req, res).catch((err) =>
-      handleUnexpectedError(res, err),
-    );
-    return;
-  }
-  const playerMatch = url.pathname.match(PLAYER_EVENTS_PATH);
-  if (req.method === 'GET' && playerMatch) {
-    const playerId = safeDecode(playerMatch[1]);
-    if (playerId === null) {
-      return sendJson(res, 400, { error: 'invalid path encoding' });
-    }
-    return handleEventsQuery(url, res, playerId);
-  }
-  const validatorMatch = url.pathname.match(VALIDATOR_EVENTS_PATH);
-  if (req.method === 'GET' && validatorMatch) {
-    const validatorId = safeDecode(validatorMatch[1]);
-    if (validatorId === null) {
-      return sendJson(res, 400, { error: 'invalid path encoding' });
-    }
-    return handleValidatorEventsQuery(url, res, validatorId);
-  }
+  return withTraceContext(traceCtx, () => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
 
-  res.writeHead(404);
-  res.end('Not Found');
+    if (req.method === 'GET' && url.pathname === '/health') {
+      return handleHealth(res);
+    }
+    if (req.method === 'GET' && url.pathname === '/metrics') {
+      return handleMetrics(res);
+    }
+    if (req.method === 'GET' && url.pathname === '/events') {
+      return handleEventsQuery(url, res);
+    }
+    if (req.method === 'GET' && url.pathname === '/stream') {
+      return handleStream(req, res, url);
+    }
+    // Exact match — must precede the /players/:id/events regex below (which
+    // wouldn't match it anyway, but the ordering documents the intent).
+    if (req.method === 'GET' && url.pathname === '/players') {
+      return handlePlayersQuery(url, res);
+    }
+    if (req.method === 'POST' && url.pathname === '/validators/approval-counts') {
+      handleApprovalCountsQuery(req, res).catch((err) =>
+        handleUnexpectedError(res, err),
+      );
+      return;
+    }
+    const playerMatch = url.pathname.match(PLAYER_EVENTS_PATH);
+    if (req.method === 'GET' && playerMatch) {
+      const playerId = safeDecode(playerMatch[1]);
+      if (playerId === null) {
+        return sendJson(res, 400, { error: 'invalid path encoding' });
+      }
+      return handleEventsQuery(url, res, playerId);
+    }
+    const validatorMatch = url.pathname.match(VALIDATOR_EVENTS_PATH);
+    if (req.method === 'GET' && validatorMatch) {
+      const validatorId = safeDecode(validatorMatch[1]);
+      if (validatorId === null) {
+        return sendJson(res, 400, { error: 'invalid path encoding' });
+      }
+      return handleValidatorEventsQuery(url, res, validatorId);
+    }
+
+    res.writeHead(404);
+    res.end('Not Found');
+  });
 }
 
 export const server = http.createServer(
