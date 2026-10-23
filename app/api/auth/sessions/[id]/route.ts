@@ -31,8 +31,9 @@ export const runtime = 'nodejs';
  */
 export async function DELETE(
   req: NextRequest,
-  { params }: { params: { id: string } },
+  props: { params: Promise<{ id: string }> },
 ) {
+  const params = await props.params;
   const log = createRequestLogger(req);
 
   const wallet = getSessionWallet(req);

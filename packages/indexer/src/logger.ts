@@ -1,17 +1,31 @@
 /**
- * Dependency-free JSON logger for the indexer.
- * Logs are written as JSON lines to stdout with level, message, timestamp,
- * and optional fields.
+ * Structured JSON logger for the indexer (issue #1519).
  *
- * Extended by issue #1478 to support W3C Trace Context propagation.
- * Incoming HTTP requests should extract the `traceparent` header and pass the
- * resulting context to `withTraceContext` so every log line emitted while
- * handling that request carries the shared `traceId` and `spanId`.
+ * Aligns to the shared log-line schema used by the Next.js app
+ * (lib/logger.ts) and the Express backend (server/src/logger.js) so that
+ * log-aggregator queries written for one service work for the others without
+ * field-name translation.
+ *
+ * Shared schema fields:
+ *   timestamp  – ISO-8601 string   (was `ts` in the old indexer logger)
+ *   level      – debug | info | warn | error
+ *   message    – human-readable description  (was `msg`)
+ *   requestId  – correlation id, optional for the indexer since it has no
+ *                HTTP request boundary, but available via createScopedLogger
+ *   route      – optional; populated by createScopedLogger
+ *   traceId / spanId – W3C trace context, present while a context is active
+ *                (issue #1478, see withTraceContext)
+ *   …fields    – any caller-supplied extra fields (spread last)
+ *
+ * The old `ts` / `msg` field names are no longer emitted so log queries
+ * written against `timestamp` and `message` work across all three services.
  */
 
 import { randomBytes } from 'crypto';
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export type LogFields = Record<string, unknown>;
 
 const LEVEL_PRIORITY: Record<LogLevel, number> = {
   debug: 0,
@@ -32,10 +46,6 @@ const currentLevel = getCurrentLogLevel();
 
 function shouldLog(level: LogLevel): boolean {
   return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[currentLevel];
-}
-
-interface LogFields {
-  [key: string]: unknown;
 }
 
 // ── W3C Trace Context ────────────────────────────────────────────────────────
@@ -89,42 +99,74 @@ export function makeChildTraceparent(ctx: TraceContext): string {
 // Module-level active trace context; set via withTraceContext() per request.
 let activeTrace: TraceContext | null = null;
 
-function log(level: LogLevel, msg: string, fields?: LogFields): void {
-  if (!shouldLog(level)) {
-    return;
-  }
+function emit(
+  level: LogLevel,
+  message: string,
+  fields?: LogFields,
+  scope?: { requestId?: string; route?: string },
+): void {
+  if (!shouldLog(level)) return;
 
-  const logEntry: Record<string, unknown> = {
+  const entry: Record<string, unknown> = {
+    timestamp: new Date().toISOString(),
     level,
-    msg,
-    ts: new Date().toISOString(),
+    ...(scope?.requestId !== undefined ? { requestId: scope.requestId } : {}),
+    ...(scope?.route !== undefined ? { route: scope.route } : {}),
+    // Issue #1478: include traceId/spanId when a trace context is active.
+    ...(activeTrace
+      ? { traceId: activeTrace.traceId, spanId: activeTrace.spanId }
+      : {}),
+    message,
+    ...(fields ?? {}),
   };
 
-  // Issue #1478: include traceId/spanId when a trace context is active.
-  if (activeTrace) {
-    logEntry['traceId'] = activeTrace.traceId;
-    logEntry['spanId'] = activeTrace.spanId;
-  }
-
-  Object.assign(logEntry, fields ?? {});
-
-  process.stdout.write(JSON.stringify(logEntry) + '\n');
+  process.stdout.write(JSON.stringify(entry) + '\n');
 }
 
+/**
+ * Module-level logger — use for indexer-wide messages not tied to a
+ * specific ledger range or pipeline run.
+ */
 export const logger = {
-  debug(msg: string, fields?: LogFields): void {
-    log('debug', msg, fields);
+  debug(message: string, fields?: LogFields): void {
+    emit('debug', message, fields);
   },
-  info(msg: string, fields?: LogFields): void {
-    log('info', msg, fields);
+  info(message: string, fields?: LogFields): void {
+    emit('info', message, fields);
   },
-  warn(msg: string, fields?: LogFields): void {
-    log('warn', msg, fields);
+  warn(message: string, fields?: LogFields): void {
+    emit('warn', message, fields);
   },
-  error(msg: string, fields?: LogFields): void {
-    log('error', msg, fields);
+  error(message: string, fields?: LogFields): void {
+    emit('error', message, fields);
   },
 };
+
+/**
+ * Creates a scoped logger that stamps every line with an optional
+ * `requestId` and `route` so lines from the same indexer pipeline run can
+ * be correlated in a log aggregator — mirrors `createRequestLogger` in
+ * lib/logger.ts and server/src/logger.js.
+ */
+export function createScopedLogger(scope: {
+  requestId?: string;
+  route?: string;
+}) {
+  return {
+    debug(message: string, fields?: LogFields): void {
+      emit('debug', message, fields, scope);
+    },
+    info(message: string, fields?: LogFields): void {
+      emit('info', message, fields, scope);
+    },
+    warn(message: string, fields?: LogFields): void {
+      emit('warn', message, fields, scope);
+    },
+    error(message: string, fields?: LogFields): void {
+      emit('error', message, fields, scope);
+    },
+  };
+}
 
 /**
  * Sets the active trace context for the current (synchronous) execution
